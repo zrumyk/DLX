@@ -32,6 +32,8 @@ import (
 
 	"github.com/andybalholm/brotli"
 	"github.com/imroc/req/v3"
+	"github.com/imroc/req/v3/http2"
+	"github.com/klauspost/compress/zstd"
 	"github.com/tidwall/gjson"
 )
 
@@ -47,30 +49,30 @@ import (
 // (appversion.go) so a DeepL release cannot silently invalidate the profile;
 // iosAppVersion below is only the fallback.
 //
-//   Transport
-//     ItaClient oneshot uses Ktor Darwin engine
-//     (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
-//     URLSession TLS. We approximate that ClientHello with utls HelloIOS.
+//	Transport
+//	  DeepL answers 429 on the iOS ClientHello (utls HelloIOS) regardless of
+//	  host or caller IP. The client therefore presents a desktop Chrome
+//	  profile — TLS ClientHello, HTTP/2 SETTINGS and header order, sec-ch-ua*
+//	  and sec-fetch-* — which is what deepl.com/translator itself sends.
 //
-//   Free URL   → https://oneshot-free.www.deepl.com/v1/translate
-//   Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
-//                (we keep oneshot-pro.www as the free-tier Pro fallback)
+//	Free URL   → https://oneshot-free.www.deepl.com/v1/translate
+//	Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
+//	             (we keep oneshot-pro.www as the free-tier Pro fallback)
 //
-//   Headers (ClientInfos.appHeaders + LoginNone):
-//     Authorization: None          (ItaClient.LoginNone)
-//     x-app-os-version             (UIDevice.systemVersion)
-//     x-app-instance-id            (stable install UUID)
-//     x-app-session-id             (session UUID)
-//     User-Agent                   (URLSession / CFNetwork product form)
-//     Accept / Accept-Encoding     (URLSession defaults)
+//	Headers (free path, an XHR from a deepl.com tab):
+//	  Authorization: None          (ItaClient.LoginNone)
+//	  User-Agent                   (desktop Chrome, matching the TLS profile)
+//	  sec-ch-ua / sec-fetch-*      (consistent with that Chrome build)
+//	  Origin / Referer             (an XHR from a deepl.com tab)
 //
-//   Body (ItaClient OneShotTranslationRequestDto + AppInformation):
-//     text[], target_lang, source_lang?, usage_type, app_information
-//     usage_type ∈ {translate, ocr, voiceforconversations}
+//	Body (free path):
+//	  text[], target_lang, source_lang?, usage_type
+//	  usage_type ∈ {translate, ocr, voiceforconversations}
+//	  The iOS app_information block is omitted: it would be a mismatched-client
+//	  tell next to a browser fingerprint. The Pro path still sends it.
 //
-// DeepL rate-limits / temporarily bans clients whose TLS + UA + app_information
-// story is inconsistent (e.g. iOS TLS fingerprint + "iOS 27.0" in the UA when
-// 27 is not a shipping OS). Keep every field on one coherent iOS profile.
+// DeepL rate-limits clients whose TLS, UA and headers tell different stories.
+// Keep every layer describing the same Chrome build.
 const (
 	oneshotFreeEndpoint = "https://oneshot-free.www.deepl.com/v1/translate"
 	oneshotProEndpoint  = "https://oneshot-pro.www.deepl.com/v1/translate"
@@ -81,7 +83,9 @@ const (
 	// ("your IP has been blocked by DeepL temporarily"), from any IP. The build
 	// number stays pinned because Apple's lookup API does not expose
 	// CFBundleVersion.
-	iosAppVersion = "26.52"
+	//
+	// Last refreshed against the US App Store on 2026-11-26 (26.59).
+	iosAppVersion = "26.59"
 	iosAppBuild   = "5443737"
 
 	// Reported OS version for app_information.os_version + x-app-os-version.
@@ -89,12 +93,6 @@ const (
 	// shipping major — a future value (e.g. 27.0) combined with an iOS TLS
 	// fingerprint is rejected with HTTP 429 and can temp-ban the IP.
 	iosOSVersion = "26.0"
-
-	// CFNetwork / Darwin versions that accompany URLSession User-Agents on
-	// the same OS generation as DTPlatformVersion 26.x (build machine
-	// BuildMachineOSBuild 25E246 → Darwin 25).
-	iosCFNetworkVersion = "3826.600.41"
-	iosDarwinVersion    = "25.0.0"
 
 	// oneshot enforces a 1500-character hard cap on the total length of
 	// the `text` array for anonymous traffic (same limit the Chrome
@@ -113,15 +111,18 @@ const (
 	warmupTimeout = 5 * time.Second
 )
 
-// instanceID mirrors the UUID the iOS app persists for analytics /
-// app_information.instance_id and x-app-instance-id: stable for the life
-// of the process, reused on every request. Rotating per-request is a
-// stronger bot signal than reusing one.
-var instanceID = newInstanceID()
+// chromeUserAgent / chromeSecCHUA must stay one consistent Chrome build so the
+// User-Agent, the client hints and the TLS fingerprint all describe the same
+// browser. Do not mix versions across the three.
+const chromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-// sessionID is sent as x-app-session-id (ClientInfos.appHeaders). Stable
-// for the process lifetime, independent of instanceID.
-var sessionID = newInstanceID()
+const chromeSecCHUA = `"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"`
+
+// instanceID mirrors the UUID the iOS app persists for analytics /
+// app_information.instance_id: stable for the life of the process, reused on
+// every Pro request. Rotating per-request is a stronger bot signal than
+// reusing one.
+var instanceID = newInstanceID()
 
 // A real iOS URLSession inherits whatever cookies the app has on
 // .deepl.com. A cold visit to www.deepl.com sets userCountry=<iso2> and
@@ -291,12 +292,14 @@ type appInformation struct {
 // oneshotRequest mirrors the body assembled by the iOS OneShotTranslator
 // / ItaClient oneshot path. Field order matches the app's serialization
 // so the JSON is byte-stable (encoding/json honours struct field order).
+// AppInformation is omitted on the free path, which presents a browser
+// fingerprint instead of the iOS app profile.
 type oneshotRequest struct {
-	Text           []string       `json:"text"`
-	TargetLang     string         `json:"target_lang"`
-	SourceLang     string         `json:"source_lang,omitempty"`
-	UsageType      string         `json:"usage_type"`
-	AppInformation appInformation `json:"app_information"`
+	Text           []string        `json:"text"`
+	TargetLang     string          `json:"target_lang"`
+	SourceLang     string          `json:"source_lang,omitempty"`
+	UsageType      string          `json:"usage_type"`
+	AppInformation *appInformation `json:"app_information,omitempty"`
 }
 
 // getOneshotClient returns a process-wide cached client for the given
@@ -318,23 +321,49 @@ func getOneshotClient(proxyURL string) (*req.Client, error) {
 }
 
 func newOneshotClient(proxyURL string) (*req.Client, error) {
-	// Match ItaClient's Ktor Darwin / URLSession profile:
-	//   - TLS ClientHello ≈ real iOS (utls HelloIOS_Auto)
-	//   - Cookie jar shared like URLSession's HTTPCookieStorage
-	//   - Common headers = what URLSession attaches by default
-	// Per-request headers (Authorization, User-Agent, x-app-*) are set in
-	// callOneshot; the client-level User-Agent is only a default.
+	// DeepL answers 429 on the iOS ClientHello (utls HelloIOS) regardless of
+	// endpoint or IP. The profile therefore rides a full desktop-Chrome
+	// fingerprint: TLS ClientHello, HTTP/2 SETTINGS and header order, and the
+	// matching sec-ch-ua / sec-fetch headers, so the request is
+	// indistinguishable from an XHR fired by a real Chrome tab on deepl.com.
 	client := req.C().
-		SetTLSFingerprintIOS().
+		SetTLSFingerprintChrome().
 		SetCookieJar(sharedCookieJar()).
 		SetTimeout(oneshotTimeout).
-		SetUserAgent(iosUserAgent(iosAppVersion)).
-		// URLSession default Accept-Encoding for data tasks.
-		SetCommonHeader("Accept-Encoding", "gzip, deflate, br").
+		SetUserAgent(chromeUserAgent).
 		SetCommonHeader("Accept", "*/*").
-		// Preferred language list — mirrors a US-locale device; DeepL
-		// does not hard-require a specific value for free oneshot.
-		SetCommonHeader("Accept-Language", "en-US,en;q=0.9")
+		SetCommonHeader("Accept-Encoding", "gzip, deflate, br, zstd").
+		SetCommonHeader("Accept-Language", "en-US,en;q=0.9").
+		SetCommonHeader("sec-ch-ua", chromeSecCHUA).
+		SetCommonHeader("sec-ch-ua-mobile", "?0").
+		SetCommonHeader("sec-ch-ua-platform", `"Windows"`).
+		// Chrome's HTTP/2 ClientHello: SETTINGS order/values, pseudo-header
+		// order, header order and connection window. Together these make the
+		// Akamai h2 fingerprint `1:65536;2:0;4:6291456;6:262144`.
+		SetCommonPseudoHeaderOder(":method", ":authority", ":scheme", ":path").
+		SetCommonHeaderOrder(
+			"sec-ch-ua",
+			"sec-ch-ua-mobile",
+			"sec-ch-ua-platform",
+			"user-agent",
+			"content-type",
+			"authorization",
+			"accept",
+			"origin",
+			"sec-fetch-site",
+			"sec-fetch-mode",
+			"sec-fetch-dest",
+			"referer",
+			"accept-encoding",
+			"accept-language",
+		).
+		SetHTTP2SettingsFrame(
+			http2.Setting{ID: http2.SettingHeaderTableSize, Val: 65536},
+			http2.Setting{ID: http2.SettingEnablePush, Val: 0},
+			http2.Setting{ID: http2.SettingInitialWindowSize, Val: 6291456},
+			http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: 262144},
+		).
+		SetHTTP2ConnectionFlow(15663105)
 
 	if proxyURL != "" {
 		u, err := url.Parse(proxyURL)
@@ -344,17 +373,6 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 		client.SetProxyURL(u.String())
 	}
 	return client, nil
-}
-
-// iosUserAgent is the URLSession product-style User-Agent the app's Ktor
-// Darwin stack emits (CFBundleName/CFBundleShortVersionString + CFNetwork
-// + Darwin). Do NOT invent alternate formats (e.g. embedding the bundle
-// ID) — mismatched UA + iOS TLS fingerprint is a cheap ban signal.
-func iosUserAgent(appVersion string) string {
-	return fmt.Sprintf(
-		"DeepL/%s CFNetwork/%s Darwin/%s",
-		appVersion, iosCFNetworkVersion, iosDarwinVersion,
-	)
 }
 
 type oneshotResponse struct {
@@ -367,9 +385,7 @@ type oneshotResponse struct {
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
 // that header puts the request on a different server-side auth branch.
-// appVersion is the value the request body advertises; the same value is
-// echoed in the User-Agent so TLS, UA and app_information stay consistent.
-func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL, appVersion string) (oneshotResponse, error) {
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL string) (oneshotResponse, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
 		return oneshotResponse{}, err
@@ -386,12 +402,14 @@ func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken,
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Authorization", authValue).
-		SetHeader("User-Agent", iosUserAgent(appVersion)).
-		// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
-		// x-app-* keys exist in the iOS binary.
-		SetHeader("x-app-os-version", iosOSVersion).
-		SetHeader("x-app-instance-id", instanceID).
-		SetHeader("x-app-session-id", sessionID).
+		SetHeader("User-Agent", chromeUserAgent).
+		// A cross-origin XHR from a deepl.com tab: same-site, CORS mode, no
+		// navigation. The x-app-* iOS headers are gone — they were the tell.
+		SetHeader("Origin", "https://www.deepl.com").
+		SetHeader("Referer", "https://www.deepl.com/en/translator").
+		SetHeader("sec-fetch-site", "same-site").
+		SetHeader("sec-fetch-mode", "cors").
+		SetHeader("sec-fetch-dest", "empty").
 		SetBodyBytes(body). // pins Content-Length; an io.Reader would
 		// force Transfer-Encoding: chunked, which URLSession JSON bodies
 		// never emit.
@@ -422,6 +440,13 @@ func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken,
 		reader = flate.NewReader(resp.Body)
 	case "br":
 		reader = brotli.NewReader(resp.Body)
+	case "zstd":
+		zr, err := zstd.NewReader(resp.Body)
+		if err != nil {
+			return response, fmt.Errorf("zstd reader: %w", err)
+		}
+		defer zr.Close()
+		reader = zr
 	}
 	raw, err := io.ReadAll(reader)
 	if err != nil {
@@ -565,11 +590,22 @@ func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang string, t
 	// official v2 API does — ignored upstream.
 	_ = tagHandling
 
-	// Resolve the advertised version once per request so the User-Agent and
-	// app_information always agree; the lookup itself is cached (appversion.go).
-	appVersion := currentIOSAppVersion()
-	if err := ctx.Err(); err != nil {
-		return DLXTranslationResult{}, err
+	// The free path presents a browser fingerprint and carries no iOS
+	// app_information, so it never needs the App Store version. Only the Pro
+	// path advertises one, in app_information.
+	var appInfo *appInformation
+	if dlSession != "" {
+		appVersion := currentIOSAppVersion()
+		if err := ctx.Err(); err != nil {
+			return DLXTranslationResult{}, err
+		}
+		appInfo = &appInformation{
+			OS:         "iOS",
+			OSVersion:  iosOSVersion,
+			AppVersion: appVersion,
+			AppBuild:   iosAppBuild,
+			InstanceID: instanceID,
+		}
 	}
 
 	// Blank texts stay here: oneshot echoes an empty input, and the positional
@@ -585,14 +621,8 @@ func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang string, t
 		TargetLang: resolvedTarget,
 		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
 		// ItaClient.OneShotUsageType.translate (also: ocr, voiceforconversations)
-		UsageType: "translate",
-		AppInformation: appInformation{
-			OS:         "iOS",
-			OSVersion:  iosOSVersion,
-			AppVersion: appVersion,
-			AppBuild:   iosAppBuild,
-			InstanceID: instanceID,
-		},
+		UsageType:      "translate",
+		AppInformation: appInfo,
 	}
 	bodyBytes, _ := json.Marshal(reqStruct)
 
@@ -602,7 +632,7 @@ func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang string, t
 	}
 
 	id := time.Now().UnixMilli()
-	response, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL, appVersion)
+	response, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL)
 	if err != nil {
 		if ctx.Err() != nil {
 			return DLXTranslationResult{}, ctx.Err()
