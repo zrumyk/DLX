@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -11,7 +12,62 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/OwO-Network/DLX/translate"
 )
+
+func TestTranslationRoutesForwardRetryAfter(t *testing.T) {
+	for _, retryAfter := range []string{"180", "Thu, 26 Nov 2026 22:00:00 GMT", ""} {
+		router := newRouter(&Config{Token: "fixture-token", DlSession: "fixture-session"},
+			func(_ context.Context, _, _ string, _ []string, _, _, _ string) (translate.DLXTranslationResult, error) {
+				return translate.DLXTranslationResult{Code: http.StatusTooManyRequests, RetryAfter: retryAfter}, nil
+			})
+		for _, route := range []string{"/translate", "/v1/translate", "/v2/translate"} {
+			request := httptest.NewRequest(http.MethodPost, route, strings.NewReader(`{"text":"Hello","target_lang":"DE"}`))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Authorization", "Bearer fixture-token")
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusTooManyRequests || recorder.Header().Get("Retry-After") != retryAfter {
+				t.Errorf("%s status = %d, Retry-After = %q, want 429 and %q", route, recorder.Code, recorder.Header().Get("Retry-After"), retryAfter)
+			}
+		}
+	}
+}
+
+func TestServiceAccessLogOmitsQueryCredentials(t *testing.T) {
+	var output bytes.Buffer
+	previous := gin.DefaultWriter
+	gin.DefaultWriter = &output
+	t.Cleanup(func() { gin.DefaultWriter = previous })
+
+	router := newRouter(&Config{Token: "synthetic-secret"}, translate.TranslateByDLXContext)
+	request := httptest.NewRequest(http.MethodPost, "/translate?token=synthetic-secret&other=synthetic-query",
+		strings.NewReader(`{"text":[],"target_lang":"DE"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, request)
+	logged := output.String()
+	if recorder.Code != http.StatusOK || !strings.Contains(logged, `POST "/translate" 200`) ||
+		strings.Contains(logged, "synthetic-secret") || strings.Contains(logged, "synthetic-query") {
+		t.Fatalf("status = %d, access log = %q", recorder.Code, logged)
+	}
+}
+
+func TestProxyErrorsOmitCredentials(t *testing.T) {
+	for _, proxy := range []string{
+		"http://user:synthetic-secret@127.0.0.1:%zz",
+		"ftp://user:synthetic-secret@127.0.0.1:8080",
+		"http://user:synthetic-secret@",
+	} {
+		cfg := Config{Proxy: proxy, Port: 1188}
+		for _, err := range []error{cfg.validate(), configureProxy(proxy)} {
+			if err == nil || strings.Contains(err.Error(), "synthetic-secret") {
+				t.Errorf("expected a redacted configuration error, got %v", err)
+			}
+		}
+	}
+}
 
 // The `text` field of POST /translate accepts either shape; decoding uses the
 // same encoding/json decoder gin binds request bodies with.

@@ -29,4 +29,5 @@ type DLXTranslationResult struct {
 	SourceLang   string   `json:"source_lang"`
 	TargetLang   string   `json:"target_lang"`
 	Method       string   `json:"method"`
+	RetryAfter   string   `json:"-"` // HTTP response metadata from an upstream 429
 }

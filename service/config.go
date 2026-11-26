@@ -13,6 +13,7 @@
 package service
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -92,18 +93,22 @@ func (c *Config) validate() error {
 	if c.Proxy == "" {
 		return nil
 	}
+	_, err := parseProxyURL(c.Proxy)
+	return err
+}
 
-	u, err := url.Parse(c.Proxy)
+func parseProxyURL(proxyURL string) (*url.URL, error) {
+	u, err := url.Parse(proxyURL)
 	if err != nil {
-		return fmt.Errorf("proxy %q: %w", c.Proxy, err)
+		return nil, errors.New("invalid proxy URL")
 	}
 	if u.Host == "" {
-		return fmt.Errorf("proxy %q has no host", c.Proxy)
+		return nil, errors.New("proxy URL has no host")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "http", "https", "socks5", "socks5h":
 	default:
-		return fmt.Errorf("proxy %q: unsupported scheme %q (want http, https, socks5 or socks5h)", c.Proxy, u.Scheme)
+		return nil, errors.New("unsupported proxy URL scheme (want http, https, socks5 or socks5h)")
 	}
-	return nil
+	return u, nil
 }

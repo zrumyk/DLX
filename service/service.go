@@ -14,6 +14,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -82,9 +84,8 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 		}
 
 		// Both places are accepted for compatibility with existing clients.
-		// The query parameter is discouraged: it ends up in access logs,
-		// browser history and Referer headers. Deployments that care can
-		// reject `?token=` at the reverse proxy.
+		// Query credentials can still appear in browser history and in
+		// logs outside DLX. Prefer an Authorization header.
 		headerToken := credentialToken(c.GetHeader("Authorization"))
 		queryToken := c.Query("token")
 
@@ -209,12 +210,9 @@ func configureProxy(proxyURL string) error {
 		return nil
 	}
 
-	u, err := url.Parse(proxyURL)
+	u, err := parseProxyURL(proxyURL)
 	if err != nil {
-		return fmt.Errorf("parse proxy url: %w", err)
-	}
-	if u.Host == "" {
-		return fmt.Errorf("proxy url %q has no host", proxyURL)
+		return err
 	}
 
 	var transport *http.Transport
@@ -282,7 +280,22 @@ func Router(cfg *Config) *gin.Engine {
 		fmt.Println("Access token is set.")
 	}
 
-	r := gin.Default()
+	return newRouter(cfg, translate.TranslateByDLXContext)
+}
+
+func newRouter(cfg *Config, runTranslation func(context.Context, string, string, []string, string, string, string) (translate.DLXTranslationResult, error)) *gin.Engine {
+	r := gin.New()
+	accessLog := gin.DefaultWriter
+	r.Use(func(c *gin.Context) {
+		start := time.Now()
+		c.Next()
+		fmt.Fprintf(accessLog, "HTTP %s %q %d %s\n",
+			c.Request.Method, c.FullPath(), c.Writer.Status(), time.Since(start))
+	})
+	r.Use(gin.CustomRecoveryWithWriter(nil, func(c *gin.Context, _ any) {
+		log.Printf("Panic serving route %q", c.FullPath())
+		c.AbortWithStatus(http.StatusInternalServerError)
+	}))
 	r.Use(cors.Default())
 	r.Use(requestBodyLimit(maxRequestBodyBytes))
 
@@ -331,13 +344,9 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, texts, tagHandling, proxyURL, "")
+		result, err := runTranslation(c.Request.Context(), sourceLang, targetLang, texts, tagHandling, proxyURL, "")
 		if err != nil {
-			log.Printf("Translation failed: %s", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    http.StatusInternalServerError,
-				"message": "Translation failed",
-			})
+			writeTranslationError(c)
 			return
 		}
 
@@ -359,11 +368,7 @@ func Router(cfg *Config) *gin.Engine {
 			}
 			c.JSON(http.StatusOK, response)
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-
+			writeUpstreamFailure(c, result)
 		}
 	})
 
@@ -412,13 +417,9 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, []string{translateText}, tagHandling, proxyURL, dlSession)
+		result, err := runTranslation(c.Request.Context(), sourceLang, targetLang, []string{translateText}, tagHandling, proxyURL, dlSession)
 		if err != nil {
-			log.Printf("Translation failed: %s", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    http.StatusInternalServerError,
-				"message": "Translation failed",
-			})
+			writeTranslationError(c)
 			return
 		}
 
@@ -433,11 +434,7 @@ func Router(cfg *Config) *gin.Engine {
 				"method":       result.Method,
 			})
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
-
+			writeUpstreamFailure(c, result)
 		}
 	})
 
@@ -468,13 +465,9 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDLX(sourceLang, targetLang, texts, "", proxyURL, "")
+		result, err := runTranslation(c.Request.Context(), sourceLang, targetLang, texts, "", proxyURL, "")
 		if err != nil {
-			log.Printf("Translation failed: %s", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"code":    http.StatusInternalServerError,
-				"message": "Translation failed",
-			})
+			writeTranslationError(c)
 			return
 		}
 
@@ -490,10 +483,7 @@ func Router(cfg *Config) *gin.Engine {
 			}
 			c.JSON(http.StatusOK, gin.H{"translations": translations})
 		} else {
-			c.JSON(result.Code, gin.H{
-				"code":    result.Code,
-				"message": result.Message,
-			})
+			writeUpstreamFailure(c, result)
 		}
 	})
 
@@ -506,6 +496,24 @@ func Router(cfg *Config) *gin.Engine {
 	})
 
 	return r
+}
+
+func writeUpstreamFailure(c *gin.Context, result translate.DLXTranslationResult) {
+	if result.Code == http.StatusTooManyRequests && result.RetryAfter != "" {
+		c.Header("Retry-After", result.RetryAfter)
+	}
+	c.JSON(result.Code, gin.H{"code": result.Code, "message": result.Message})
+}
+
+func writeTranslationError(c *gin.Context) {
+	if c.Request.Context().Err() != nil {
+		return
+	}
+	log.Print("Translation failed")
+	c.JSON(http.StatusInternalServerError, gin.H{
+		"code":    http.StatusInternalServerError,
+		"message": "Translation failed",
+	})
 }
 
 // v2Payload is the JSON body of POST /v2/translate. `text` mirrors /translate:

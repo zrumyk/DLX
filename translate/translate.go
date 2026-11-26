@@ -180,7 +180,7 @@ func newInstanceID() string {
 // regional default (en-US, pt-BR).
 var targetLangMap = map[string]string{
 	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "DE-CH": "de-CH",
-	"EL": "el",
+	"EL":    "el",
 	"EN-GB": "en-GB", "EN-US": "en-US",
 	"ES": "es", "ES-419": "es-419", "ET": "et", "FI": "fi", "FR": "fr", "FR-CA": "fr-CA",
 	"HE": "he", "HU": "hu", "ID": "id", "IT": "it", "JA": "ja", "KO": "ko",
@@ -357,16 +357,22 @@ func iosUserAgent(appVersion string) string {
 	)
 }
 
-// callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
+type oneshotResponse struct {
+	body       gjson.Result
+	status     int
+	retryAfter string
+}
+
+// callOneshot POSTs to the oneshot endpoint and returns its status and data.
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — matching ItaClient.LoginNone. Omitting
 // that header puts the request on a different server-side auth branch.
 // appVersion is the value the request body advertises; the same value is
 // echoed in the User-Agent so TLS, UA and app_information stay consistent.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion string) (gjson.Result, int, error) {
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL, appVersion string) (oneshotResponse, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
-		return gjson.Result{}, 0, err
+		return oneshotResponse{}, err
 	}
 
 	// LoginNone → literal "None"; LoginPro/Free → "Bearer <access_token>".
@@ -376,6 +382,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 	}
 
 	resp, err := client.R().
+		SetContext(ctx).
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Authorization", authValue).
@@ -390,9 +397,15 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 		// never emit.
 		Post(endpoint)
 	if err != nil {
-		return gjson.Result{}, 0, err
+		return oneshotResponse{}, err
 	}
 	defer resp.Body.Close()
+
+	response := oneshotResponse{status: resp.StatusCode}
+	if response.status == http.StatusTooManyRequests {
+		response.retryAfter = resp.Header.Get("Retry-After")
+		return response, nil
+	}
 
 	// Once we set Accept-Encoding ourselves, Go's HTTP stack stops
 	// transparently decompressing, so handle gzip/deflate/br by hand.
@@ -401,7 +414,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 	case "gzip":
 		gr, err := gzip.NewReader(resp.Body)
 		if err != nil {
-			return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+			return response, fmt.Errorf("gzip reader: %w", err)
 		}
 		defer gr.Close()
 		reader = gr
@@ -412,9 +425,10 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL, appVersion
 	}
 	raw, err := io.ReadAll(reader)
 	if err != nil {
-		return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+		return response, fmt.Errorf("read response body: %w", err)
 	}
-	return gjson.ParseBytes(raw), resp.StatusCode, nil
+	response.body = gjson.ParseBytes(raw)
+	return response, nil
 }
 
 // textLength returns the length of text in UTF-16 code units — the unit
@@ -495,6 +509,14 @@ func translationsFromResult(result gjson.Result, count int) ([]string, error) {
 // to the Pro endpoint; the value is sent verbatim as the Bearer token (i.e.
 // it must be an OAuth access token, not the legacy dl_session cookie).
 func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling string, proxyURL string, dlSession string) (DLXTranslationResult, error) {
+	return TranslateByDLXContext(context.Background(), sourceLang, targetLang, texts, tagHandling, proxyURL, dlSession)
+}
+
+// TranslateByDLXContext cancels the upstream translation when ctx is done.
+func TranslateByDLXContext(ctx context.Context, sourceLang, targetLang string, texts []string, tagHandling, proxyURL, dlSession string) (DLXTranslationResult, error) {
+	if err := ctx.Err(); err != nil {
+		return DLXTranslationResult{}, err
+	}
 	// oneshot charges its anonymous cap against the total length of the
 	// `text` array, and a batch is one upstream request, so the cap applies
 	// to the sum of the texts that are actually sent.
@@ -546,6 +568,9 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 	// Resolve the advertised version once per request so the User-Agent and
 	// app_information always agree; the lookup itself is cached (appversion.go).
 	appVersion := currentIOSAppVersion()
+	if err := ctx.Err(); err != nil {
+		return DLXTranslationResult{}, err
+	}
 
 	// Blank texts stay here: oneshot echoes an empty input, and the positional
 	// check on the answer would read that echo as a failed translation and fail
@@ -577,8 +602,11 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL, appVersion)
+	response, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL, appVersion)
 	if err != nil {
+		if ctx.Err() != nil {
+			return DLXTranslationResult{}, ctx.Err()
+		}
 		// Map upstream timeouts to 504 so callers can distinguish "DeepL
 		// took too long" from other 503 failure modes (DNS, TLS, etc.).
 		var ue *url.Error
@@ -592,18 +620,20 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: err.Error(),
+			Message: "upstream DeepL request failed",
 		}, nil
 	}
 
-	switch status {
+	result := response.body
+	switch response.status {
 	case http.StatusOK:
 		// fall through to body parsing
 	case http.StatusTooManyRequests:
 		return DLXTranslationResult{
-			ID:      id,
-			Code:    http.StatusTooManyRequests,
-			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
+			ID:         id,
+			Code:       http.StatusTooManyRequests,
+			Message:    "DeepL rate limited the request",
+			RetryAfter: response.retryAfter,
 		}, nil
 	case http.StatusForbidden:
 		// iOS surfaces this as OneShot: Forbidden / AuthenticationFailed /
@@ -624,7 +654,7 @@ func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling s
 		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
-			Message: fmt.Sprintf("request failed with status code: %d", status),
+			Message: fmt.Sprintf("request failed with status code: %d", response.status),
 		}, nil
 	}
 
