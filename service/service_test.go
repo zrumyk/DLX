@@ -1,7 +1,9 @@
 package service
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -84,6 +86,271 @@ func TestTranslateHandlerAnswersEmptyText(t *testing.T) {
 			}
 			if !strings.Contains(recorder.Body.String(), tt.wantInBody) {
 				t.Fatalf("POST /translate %s body = %s, want it to contain %s", tt.payload, recorder.Body.String(), tt.wantInBody)
+			}
+		})
+	}
+}
+
+func TestCredentialToken(t *testing.T) {
+	tests := []struct {
+		header string
+		want   string
+	}{
+		{"Bearer secret", "secret"},
+		{"bearer secret", "secret"},
+		{"BEARER secret", "secret"},
+		{"DeepL-Auth-Key secret", "secret"},
+		{"deepl-auth-key secret", "secret"},
+		{"Bearer   secret", "secret"}, // runs of whitespace
+		{"Bearer secret extra", ""},
+		{"Basic secret", ""},
+		{"secret", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		if got := credentialToken(tt.header); got != tt.want {
+			t.Errorf("credentialToken(%q) = %q, want %q", tt.header, got, tt.want)
+		}
+	}
+}
+
+func TestAuthMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.POST("/x", authMiddleware(&Config{Token: "secret"}), func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
+
+	tests := []struct {
+		name   string
+		header string
+		query  string
+		want   int
+	}{
+		{"no credentials", "", "", http.StatusUnauthorized},
+		{"bearer", "Bearer secret", "", http.StatusNoContent},
+		{"lowercase scheme", "bearer secret", "", http.StatusNoContent},
+		{"deepl auth key", "DeepL-Auth-Key secret", "", http.StatusNoContent},
+		{"double space", "Bearer  secret", "", http.StatusNoContent},
+		{"wrong token", "Bearer nope", "", http.StatusUnauthorized},
+		{"wrong scheme", "Basic secret", "", http.StatusUnauthorized},
+		{"query token", "", "?token=secret", http.StatusNoContent},
+		{"wrong query token", "", "?token=nope", http.StatusUnauthorized},
+		{"empty query token", "", "?token=", http.StatusUnauthorized},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/x"+tt.query, nil)
+			if tt.header != "" {
+				request.Header.Set("Authorization", tt.header)
+			}
+			router.ServeHTTP(recorder, request)
+			if recorder.Code != tt.want {
+				t.Fatalf("status = %d, want %d (body %s)", recorder.Code, tt.want, recorder.Body.String())
+			}
+		})
+	}
+}
+
+// Only dl_session may become the upstream credential; other cookies must never
+// be folded into the token (the pre-audit handler sent "Bearer foo=1; fakepro").
+func TestRequestDlSession(t *testing.T) {
+	tests := []struct {
+		name       string
+		cookie     string
+		want       string
+		wantCookie bool
+	}{
+		{"no header", "", "fallback", false},
+		{"plain cookie", "dl_session=abc", "abc", true},
+		{"other cookies are ignored", "foo=1; dl_session=abc; bar=2", "abc", true},
+		{"quoted value", `dl_session="abc"`, "abc", true},
+		{"bare value for compatibility", "abc", "abc", true},
+		{"cookie that is not dl_session", "foo=1", "fallback", false},
+		{"empty dl_session", "dl_session=", "fallback", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			request := httptest.NewRequest(http.MethodPost, "/v1/translate", nil)
+			if tt.cookie != "" {
+				request.Header.Set("Cookie", tt.cookie)
+			}
+			c.Request = request
+
+			got, fromCookie := requestDlSession(c, "fallback")
+			if got != tt.want || fromCookie != tt.wantCookie {
+				t.Fatalf("requestDlSession() = (%q, %v), want (%q, %v)", got, fromCookie, tt.want, tt.wantCookie)
+			}
+		})
+	}
+}
+
+func TestRequestBodyLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := Router(&Config{})
+
+	body := `{"text":"` + strings.Repeat("a", maxRequestBodyBytes) + `","target_lang":"EN"}`
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/translate", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d (body %s)", recorder.Code, http.StatusRequestEntityTooLarge, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), `"code":413`) {
+		t.Fatalf("body = %s, want a 413 payload", recorder.Body.String())
+	}
+}
+
+func newV2Context(t *testing.T, contentType string, body []byte) *gin.Context {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	request := httptest.NewRequest(http.MethodPost, "/v2/translate", bytes.NewReader(body))
+	if contentType != "" {
+		request.Header.Set("Content-Type", contentType)
+	}
+	c.Request = request
+	// requestBodyLimit does this in the real pipeline.
+	c.Set(contextRawBody, body)
+	return c
+}
+
+func TestParseV2Request(t *testing.T) {
+	var multipartBody bytes.Buffer
+	mw := multipart.NewWriter(&multipartBody)
+	for _, kv := range [][2]string{
+		{"text", "Hello"}, {"text", "Good morning"}, {"source_lang", "EN"}, {"target_lang", "UK"},
+	} {
+		_ = mw.WriteField(kv[0], kv[1])
+	}
+	_ = mw.Close()
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantTexts   []string
+		wantSource  string
+		wantTarget  string
+		wantErr     bool
+	}{
+		{
+			name: "json string", contentType: "application/json",
+			body:      `{"text":"Hello","source_lang":"EN","target_lang":"UK"}`,
+			wantTexts: []string{"Hello"}, wantSource: "EN", wantTarget: "UK",
+		},
+		{
+			name: "json array", contentType: "application/json",
+			body:      `{"text":["Hello","Good morning"],"source_lang":"EN","target_lang":"UK"}`,
+			wantTexts: []string{"Hello", "Good morning"}, wantSource: "EN", wantTarget: "UK",
+		},
+		{
+			name:      "json without content type",
+			body:      `{"text":["Hello","Good morning"],"target_lang":"UK"}`,
+			wantTexts: []string{"Hello", "Good morning"}, wantTarget: "UK",
+		},
+		{
+			name: "json null", contentType: "application/json",
+			body:       `{"text":null,"target_lang":"UK"}`,
+			wantTarget: "UK",
+		},
+		{
+			name: "form repeats", contentType: "application/x-www-form-urlencoded",
+			body:      "text=Hello&text=Good+morning&source_lang=EN&target_lang=UK",
+			wantTexts: []string{"Hello", "Good morning"}, wantSource: "EN", wantTarget: "UK",
+		},
+		{
+			name:      "form without content type",
+			body:      "text=Hello&text=Good+morning&target_lang=UK",
+			wantTexts: []string{"Hello", "Good morning"}, wantTarget: "UK",
+		},
+		{
+			name: "multipart", contentType: mw.FormDataContentType(), body: multipartBody.String(),
+			wantTexts: []string{"Hello", "Good morning"}, wantSource: "EN", wantTarget: "UK",
+		},
+		{
+			name: "malformed json", contentType: "application/json", body: `{"text":`,
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newV2Context(t, tt.contentType, []byte(tt.body))
+			texts, source, target, err := parseV2Request(c)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseV2Request() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if !reflect.DeepEqual(texts, tt.wantTexts) || source != tt.wantSource || target != tt.wantTarget {
+				t.Fatalf("parseV2Request() = (%q, %q, %q), want (%q, %q, %q)",
+					texts, source, target, tt.wantTexts, tt.wantSource, tt.wantTarget)
+			}
+		})
+	}
+}
+
+// /v2/translate answers one translation object per requested text, and never
+// reaches DeepL for blank texts.
+func TestV2HandlerBlankBatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := Router(&Config{})
+
+	tests := []struct {
+		name       string
+		payload    string
+		wantCode   int
+		wantInBody string
+	}{
+		{
+			name:       "blank batch keeps positions",
+			payload:    `{"text":["","  "],"source_lang":"EN","target_lang":"UK"}`,
+			wantCode:   http.StatusOK,
+			wantInBody: `"translations":[{"detected_source_language":"EN","text":""},{"detected_source_language":"EN","text":"  "}]`,
+		},
+		{
+			name:       "single empty string",
+			payload:    `{"text":"","source_lang":"EN","target_lang":"UK"}`,
+			wantCode:   http.StatusOK,
+			wantInBody: `"translations":[{"detected_source_language":"EN","text":""}]`,
+		},
+		{
+			name:       "empty array",
+			payload:    `{"text":[],"target_lang":"UK"}`,
+			wantCode:   http.StatusBadRequest,
+			wantInBody: `text is required`,
+		},
+		{
+			name:       "missing text",
+			payload:    `{"target_lang":"UK"}`,
+			wantCode:   http.StatusBadRequest,
+			wantInBody: `text is required`,
+		},
+		{
+			name:       "missing target",
+			payload:    `{"text":"Hello"}`,
+			wantCode:   http.StatusBadRequest,
+			wantInBody: `target_lang is required`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			recorder := httptest.NewRecorder()
+			request := httptest.NewRequest(http.MethodPost, "/v2/translate", strings.NewReader(tt.payload))
+			request.Header.Set("Content-Type", "application/json")
+			router.ServeHTTP(recorder, request)
+
+			if recorder.Code != tt.wantCode {
+				t.Fatalf("status = %d, want %d (body %s)", recorder.Code, tt.wantCode, recorder.Body.String())
+			}
+			if !strings.Contains(recorder.Body.String(), tt.wantInBody) {
+				t.Fatalf("body = %s, want it to contain %s", recorder.Body.String(), tt.wantInBody)
 			}
 		})
 	}

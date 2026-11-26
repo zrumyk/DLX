@@ -15,7 +15,10 @@ package service
 import (
 	"flag"
 	"fmt"
+	"log"
+	"net/url"
 	"os"
+	"strings"
 )
 
 type Config struct {
@@ -71,5 +74,36 @@ func InitConfig() *Config {
 	}
 
 	flag.Parse()
+
+	// Fail fast on a configuration that cannot work, instead of binding a
+	// nonsensical port or discovering a malformed proxy on the first request.
+	if err := cfg.validate(); err != nil {
+		log.Fatalf("Invalid configuration: %v", err)
+	}
 	return cfg
+}
+
+// validate checks the values that flag/env parsing cannot express: a port in
+// the TCP range and a proxy URL that net/http and req can actually dial.
+func (c *Config) validate() error {
+	if c.Port < 1 || c.Port > 65535 {
+		return fmt.Errorf("port %d is out of range 1-65535", c.Port)
+	}
+	if c.Proxy == "" {
+		return nil
+	}
+
+	u, err := url.Parse(c.Proxy)
+	if err != nil {
+		return fmt.Errorf("proxy %q: %w", c.Proxy, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("proxy %q has no host", c.Proxy)
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("proxy %q: unsupported scheme %q (want http, https, socks5 or socks5h)", c.Proxy, u.Scheme)
+	}
+	return nil
 }
