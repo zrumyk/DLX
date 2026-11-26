@@ -13,10 +13,13 @@
 package translate
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -165,6 +168,24 @@ func TestCurrentIOSAppVersionFallsBackOnMalformedBody(t *testing.T) {
 
 	if got := currentIOSAppVersion(); got != iosAppVersion {
 		t.Fatalf("currentIOSAppVersion() = %q, want fallback %q", got, iosAppVersion)
+	}
+}
+
+func TestAppVersionLookupLogOmitsResponseDetails(t *testing.T) {
+	server, _ := lookupServer(t, "synthetic-credential", http.StatusOK)
+	resetProvider(t, server.URL)
+
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	if got := currentIOSAppVersion(); got != iosAppVersion {
+		t.Fatalf("currentIOSAppVersion() = %q, want fallback %q", got, iosAppVersion)
+	}
+	if logged := output.String(); !strings.Contains(logged, "app version lookup failed") ||
+		strings.Contains(logged, "synthetic-credential") {
+		t.Fatalf("unexpected lookup log: %q", logged)
 	}
 }
 

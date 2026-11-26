@@ -55,8 +55,7 @@ const (
 )
 
 // appVersionHTTPClient is shared so repeat lookups reuse the connection pool.
-// It is separate from the translation client: no TLS fingerprint, no cookies,
-// no proxy.
+// It is separate from the translation client and uses the default HTTP transport.
 var appVersionHTTPClient = &http.Client{Timeout: appVersionLookupTimeout}
 
 // appVersionProvider resolves and caches the DeepL iOS version this client
@@ -99,7 +98,7 @@ func currentIOSAppVersion() string {
 	}
 	if err != nil {
 		fallback := p.cachedOrFallback()
-		log.Printf("DeepL iOS app version lookup failed, falling back to %s: %v", fallback, err)
+		log.Printf("DeepL iOS app version lookup failed, falling back to %s", fallback)
 		return fallback
 	}
 	p.version = version
